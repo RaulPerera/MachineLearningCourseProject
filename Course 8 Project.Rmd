@@ -1,0 +1,195 @@
+---
+title: "Machine Learning Course Project"
+author: "Raul Perera"
+date: "June 30, 2018"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+```{r setup, include=FALSE, cache=TRUE}
+
+##Setup
+knitr::opts_chunk$set(echo = TRUE)
+library(caret)
+library(parallel)
+library(doParallel)
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+set.seed(123)
+
+##Import Data
+FullData = read.csv("pml-training.csv")
+Grading = read.csv("pml-testing.csv")
+##Remove columns that are all NAs
+Gradingsubset <- Grading[,colSums(is.na(Grading)) == 0] 
+##Remove row index, user name, timestamps and other variables that might be associated with the test design
+Gradingsubset2 <- Gradingsubset[,-(1:7)] 
+FullDataSubset <- FullData[,colSums(is.na(Grading)) == 0] 
+FullDataSubset2 <- FullDataSubset[,-(1:7)] 
+inTrain = createDataPartition(FullDataSubset2$classe, p = 2/5)[[1]]
+##Create three partitions 40% Training, 40% Test, 20% Validation
+training = FullDataSubset2[ inTrain,]
+testing.validation = FullDataSubset2[-inTrain,]
+inTest = createDataPartition(testing.validation$classe, p = 2/3)[[1]]
+testing = testing.validation[ inTest,]
+validation = testing.validation[-inTest,]
+```
+
+## Executive Summary
+The goal of this project was to use accelerometer data to classify the quality of a specific exercise activity.  The training data came from an experiement where participants were asked to perform an activity in one of 5 different ways. More information is available at http://groupware.les.inf.puc-rio.br/har
+
+To accomplish this a Random Forest Model, a Gradient Boosting Model, and a Support Vector Machine Model were built. These models were then combined into an ensemble model using a Random Forest model.  The accuracy of this Ensemble model was estimated as 98.6% with a 95% CI of 98.2% to 98.9%.
+
+## Exploratory Data Analysis
+To better understand the initial data set, a classification tree was built using the CART package.  In the first run, it was discovered that the variable Index was the strongest predictor of how the exercise was performed.  This was largely a result of the way the data was collected and ordered, Index is not a variable that would be available for future prediction so it along with several related variables was dropped from the dataset.  With the dataset fixed, the classification tree was rebuilt with more intuitive results.
+
+```{r EDA, warning=FALSE,message=FALSE, cache=TRUE}
+## First Model, easy to interpert as a form of exploratory Data Analysis
+fitControl <- trainControl(method = "cv",number = 5,allowParallel = TRUE)
+
+rpart.model <- train(classe~.,data=training,method="rpart",na.action=na.omit,trControl = fitControl)
+
+library(rattle)
+fancyRpartPlot(rpart.model$finalModel)
+
+stopCluster(cluster)
+registerDoSEQ()
+
+```
+## Model Selection and Creation
+The model selected for this was an ensemble model built using component models of Random Forest, GBM, and SVM.  These models would be combined using a Random Forest model.  This approach was chosen as these are 3 of the strongest classification algorithims and using an ensemble approach would enable combining the best of each submodel.  Linear Discriminant Analysis was also considered but ruled out since we were not trying to predict a binary outcome.
+
+Holdout Design
+Due to the use of an ensemble model, the dataset was partitioned into 3 datasets.
+ * 40% Training - Used to train each of the submodels
+ * 40% Test - Used to test the submodels as well as to train the ensemble model
+ * 20% Validation - Used to test the ensemble model
+
+Cross Validation
+Each model was trained using K-Fold cross validation with 5 chosen as the number of folds.  Five folds was chosen as a compromise between the increased variance that comes with more folds and the increased bias that comes with fewer folds.
+
+
+```{r RF_Model, warning=FALSE,message=FALSE, cache=TRUE}
+## Random Forest Model
+fitControl <- trainControl(method = "cv",number = 5,allowParallel = TRUE)
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+rf.model <- train(classe~., data=training,method="rf",na.action=na.omit,trControl = fitControl,prox=TRUE)
+
+stopCluster(cluster)
+registerDoSEQ()
+
+```
+```{r GBM_Model, warning=FALSE,message=FALSE, cache=TRUE}
+## Gradient Boosting Model
+fitControl <- trainControl(method = "cv",number = 5,allowParallel = TRUE)
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+gbm.model <- train(classe~.,data=training,method="gbm",na.action=na.omit,trControl = fitControl, verbose=FALSE)
+
+stopCluster(cluster)
+registerDoSEQ()
+```
+```{r SVM_Model, warning=FALSE,message=FALSE, cache=TRUE}
+## SVM
+fitControl <- trainControl(method = "cv", number = 5, allowParallel = TRUE)
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+svm.model <- train(classe~.,data=training,method="svmLinear2", na.action=na.omit,trControl = fitControl)
+
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+
+```{r Ensemble_Model, warning=FALSE,message=FALSE, cache=TRUE}
+## Ensemble Model
+
+#Predict the submodels and on the testing partition and evaluate the accuracy of each
+Testing.Predict.RF <- predict(rf.model,newdata = testing)
+Testing.Predict.GBM <- predict(gbm.model,newdata = testing)
+Testing.Predict.svm <- predict(svm.model,newdata = testing)
+confusionMatrix(Testing.Predict.RF,testing$classe)$overall[1]
+confusionMatrix(Testing.Predict.GBM,testing$classe)$overall[1]
+confusionMatrix(Testing.Predict.svm,testing$classe)$overall[1]
+
+##Create a dataset on which to train the ensemble model by combining the submodel predictions of the testing partition with the testing partition results
+EnsembleDataset <- data.frame(Testing.Predict.RF,Testing.Predict.GBM,Testing.Predict.svm,testing$classe)
+
+fitControl <- trainControl(method = "cv",number = 5,allowParallel = TRUE)
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+rf.ensemble.model <- train(testing.classe~.,data=EnsembleDataset,method="rf",trControl = fitControl)
+
+stopCluster(cluster)
+registerDoSEQ()
+
+##Evaluate the ensemble model
+
+##To predict the validation partition with the ensemble model, the submodels first need to be predicted
+Validation.Predict.RF <- predict(rf.model,newdata = validation)
+Validation.Predict.GBM <- predict(gbm.model,newdata = validation)
+Validation.Predict.svm <- predict(svm.model,newdata = validation)
+##The Submodel Predictions are combined into one dataframe with the same naming convention that was used to train the model.
+EnsembleDataset.validation <- data.frame(
+  Validation.Predict.RF,
+  Validation.Predict.GBM,
+  Validation.Predict.svm)
+names(EnsembleDataset.validation) <- names(EnsembleDataset[,1:3])
+##The ensemble model can now be predicted for the validation dataset and compared to the actual results on the validation partition
+Validation.Predict.EnsembleRF <- predict(rf.ensemble.model,newdata = EnsembleDataset.validation)
+
+```
+## Analysis
+The Random Forest and GBM submodels performed very well with estimated accuracies of 98.5% and 95.5%. The SVM submodel was not as strong with an estimated accuracy of 77.5%
+
+The ensemble model essentially performed the same as the Random Forest submodel. The ensemble model should generally perform as strong as its submodels as it can always be simplified to any one component.  On the other hand it is a bit surprising the ensemble model is no better than the RF submodel, however given the very strong performance of the submode, it is less surprising that it could not be improved upon.
+
+```{r Analysis, warning=FALSE,message=FALSE, cache=TRUE}
+##Ensemble Model Accuracy
+confusionMatrix(Validation.Predict.EnsembleRF,validation$classe)$overall
+##Random Forest Model Accuracy
+confusionMatrix(Validation.Predict.RF,validation$classe)$overall
+```
+
+
+
+```{r Appendix, warning=FALSE,message=FALSE, cache=TRUE, echo=FALSE}
+## Interim Model Checks
+
+# rpart.model$resample
+# confusionMatrix.train(rpart.model)
+# 
+# rf.model
+# rf.model$resample
+# confusionMatrix.train(rf.model)
+# 
+# gbm.model
+# gbm.model$resample
+# confusionMatrix.train(gbm.model)
+# 
+# svm.model
+# svm.model$resample
+# confusionMatrix.train(svm.model)
+# 
+# rf.ensemble.model
+
+##Predicting the grading dataset using the ensemble model
+# Grading.Predict.RF <- predict(rf.model,newdata = Gradingsubset2)
+# Grading.Predict.GBM <- predict(gbm.model,newdata = Gradingsubset2)
+# Grading.Predict.svm <- predict(svm.model,newdata = Gradingsubset2)
+# 
+# EnsembleDataset.Grading<- data.frame(
+#   Grading.Predict.RF,
+#   Grading.Predict.GBM,
+#   Grading.Predict.svm)
+# names(EnsembleDataset.Grading) <- names(EnsembleDataset[,1:3])
+# 
+# Grading.Predict.RF_Ensemble <- predict(rf.ensemble.model,newdata = EnsembleDataset.Grading)
+```
+
